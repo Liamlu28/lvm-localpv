@@ -33,6 +33,16 @@ import (
 	apis "github.com/openebs/lvm-localpv/pkg/apis/openebs.io/lvm/v1alpha1"
 )
 
+var (
+	newSafeFormatAndMount = func() *mount.SafeFormatAndMount {
+		return &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: utilexec.New()}
+	}
+	getDeviceNameFromMount = mount.GetDeviceNameFromMount
+	pathExistsFunc         = mount.PathExists
+	removePath             = os.Remove
+	getDeviceMounts        = mnt.GetMounts
+)
+
 // MountInfo contains the volume related info
 // for all types of volumes in LVMVolume
 type MountInfo struct {
@@ -69,7 +79,7 @@ type PodLVInfo struct {
 
 // FormatAndMountVol formats and mounts the created volume to the desired mount path
 func FormatAndMountVol(devicePath string, mountInfo *MountInfo) error {
-	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: utilexec.New()}
+	mounter := newSafeFormatAndMount()
 
 	err := mounter.FormatAndMountSensitiveWithFormatOptions(
 		devicePath,
@@ -93,9 +103,9 @@ func FormatAndMountVol(devicePath string, mountInfo *MountInfo) error {
 // UmountVolume unmounts the volume and the corresponding mount path is removed
 func UmountVolume(vol *apis.LVMVolume, targetPath string,
 ) error {
-	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: utilexec.New()}
+	mounter := newSafeFormatAndMount()
 
-	dev, ref, err := mount.GetDeviceNameFromMount(mounter, targetPath)
+	dev, ref, err := getDeviceNameFromMount(mounter, targetPath)
 	if err != nil {
 		klog.Errorf(
 			"lvm: umount volume: failed to get device from mnt: %s\nError: %v",
@@ -113,7 +123,7 @@ func UmountVolume(vol *apis.LVMVolume, targetPath string,
 		return nil
 	}
 
-	if pathExists, pathErr := mount.PathExists(targetPath); pathErr != nil {
+	if pathExists, pathErr := pathExistsFunc(targetPath); pathErr != nil {
 		return fmt.Errorf("error checking if path exists: %v", pathErr)
 	} else if !pathExists {
 		klog.Warningf(
@@ -131,8 +141,27 @@ func UmountVolume(vol *apis.LVMVolume, targetPath string,
 		return err
 	}
 
-	if err := os.Remove(targetPath); err != nil {
-		klog.Errorf("lvm: failed to remove mount path vol %s err : %v", vol.Name, err)
+	devicePath := GetVolumeDevPath(vol)
+	currentMounts, err := getDeviceMounts(devicePath)
+	if err != nil {
+		klog.Errorf("lvm: failed to verify mount state for %s after unmount: %v", vol.Name, err)
+		return err
+	}
+	for _, mp := range uniqueMounts(currentMounts) {
+		if mp == targetPath {
+			err = fmt.Errorf("lvm: unmount incomplete for %s: device %s still mounted at %s", vol.Name, devicePath, targetPath)
+			klog.Error(err)
+			return err
+		}
+	}
+
+	if err := removePath(targetPath); err != nil {
+		if os.IsNotExist(err) {
+			klog.Warningf("Warning: mount path already removed for volume %s: %v", vol.Name, targetPath)
+		} else {
+			klog.Errorf("lvm: failed to remove mount path vol %s err : %v", vol.Name, err)
+			return err
+		}
 	}
 
 	klog.Infof("umount done %s path %v", vol.Name, targetPath)
@@ -162,12 +191,14 @@ func verifyMountRequest(vol *apis.LVMVolume, mountpath string) (bool, error) {
 	 * be unmounted before proceeding to the mount
 	 * operation.
 	 */
-	currentMounts, err := mnt.GetMounts(devicePath)
+	currentMounts, err := getDeviceMounts(devicePath)
 	if err != nil {
 		klog.Errorf("can not get mounts for volume:%s dev %s err: %v",
 			vol.Name, devicePath, err.Error())
 		return false, status.Errorf(codes.Internal, "verifyMount: Getmounts failed %s", err.Error())
 	} else if len(currentMounts) >= 1 {
+		currentMounts = uniqueMounts(currentMounts)
+
 		// if device is already mounted at the mount point, return successful
 		for _, mp := range currentMounts {
 			if mp == mountpath {
@@ -185,6 +216,22 @@ func verifyMountRequest(vol *apis.LVMVolume, mountpath string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func uniqueMounts(mounts []string) []string {
+	if len(mounts) < 2 {
+		return mounts
+	}
+	seen := make(map[string]struct{}, len(mounts))
+	result := make([]string, 0, len(mounts))
+	for _, mp := range mounts {
+		if _, ok := seen[mp]; ok {
+			continue
+		}
+		seen[mp] = struct{}{}
+		result = append(result, mp)
+	}
+	return result
 }
 
 // MountVolume mounts the disk to the specified path
@@ -251,7 +298,7 @@ func MountBlock(vol *apis.LVMVolume, mountinfo *MountInfo, podLVInfo *PodLVInfo)
 
 	mountopt := []string{"bind"}
 
-	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: utilexec.New()}
+	mounter := newSafeFormatAndMount()
 
 	// Create the mount point as a file since bind mount device node requires it to be a file
 	err := makeFile(target)
@@ -261,7 +308,7 @@ func MountBlock(vol *apis.LVMVolume, mountinfo *MountInfo, podLVInfo *PodLVInfo)
 
 	// do the bind mount of the device at the target path
 	if err := mounter.Mount(devicePath, target, "", mountopt); err != nil {
-		if removeErr := os.Remove(target); removeErr != nil {
+		if removeErr := removePath(target); removeErr != nil {
 			return status.Errorf(codes.Internal, "Could not remove mount target %q: %v", target, removeErr)
 		}
 		return status.Errorf(codes.Internal, "mount failed at %v err : %v", target, err)
